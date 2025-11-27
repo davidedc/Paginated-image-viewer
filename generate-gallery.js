@@ -2,35 +2,40 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const { execSync } = require('child_process');
 
 // Configuration
 const IMAGES_PER_PAGE = 15;
 const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'];
+const VIDEO_EXTENSIONS = ['.mp4'];
+const MEDIA_EXTENSIONS = [...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS];
 const OUTPUT_DATA_FILE = 'images-data.js';
 const OUTPUT_HTML_FILE = 'gallery.html';
 const THUMBNAILS_DIR = 'thumbnails';
 const THUMBNAIL_SIZE = 300;
 const CONCURRENT_THUMBNAILS = 8;
+const VIDEO_THUMBNAIL_FPS = 15;          // Playback FPS for animated thumbnail
 
 // Get the directory where the script is run from
 const ROOT_DIR = process.cwd();
 
-console.log(`Scanning for images in: ${ROOT_DIR}`);
+console.log(`Scanning for media in: ${ROOT_DIR}`);
 
 // Track seen file sizes for deduplication
 const seenSizes = new Set();
 let duplicatesSkipped = 0;
 
 /**
- * Recursively find all image files in a directory
+ * Recursively find all media files (images and videos) in a directory
  */
-function findImages(dir, images = []) {
+function findMedia(dir, media = []) {
   let entries;
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
   } catch (err) {
     console.warn(`Warning: Could not read directory ${dir}: ${err.message}`);
-    return images;
+    return media;
   }
 
   for (const entry of entries) {
@@ -42,10 +47,10 @@ function findImages(dir, images = []) {
     }
 
     if (entry.isDirectory()) {
-      findImages(fullPath, images);
+      findMedia(fullPath, media);
     } else if (entry.isFile()) {
       const ext = path.extname(entry.name).toLowerCase();
-      if (IMAGE_EXTENSIONS.includes(ext)) {
+      if (MEDIA_EXTENSIONS.includes(ext)) {
         try {
           const stats = fs.statSync(fullPath);
 
@@ -57,9 +62,11 @@ function findImages(dir, images = []) {
           seenSizes.add(stats.size);
 
           const relativePath = path.relative(ROOT_DIR, fullPath);
-          images.push({
+          const isVideo = VIDEO_EXTENSIONS.includes(ext);
+          media.push({
             path: relativePath,
-            size: stats.size
+            size: stats.size,
+            type: isVideo ? 'video' : 'image'
           });
         } catch (err) {
           console.warn(`Warning: Could not read ${fullPath}: ${err.message}`);
@@ -68,7 +75,7 @@ function findImages(dir, images = []) {
     }
   }
 
-  return images;
+  return media;
 }
 
 /**
@@ -98,32 +105,139 @@ function hashPath(str) {
 }
 
 /**
- * Get thumbnail path for an image (hash-based with nested directories)
+ * Get thumbnail path for a media file (hash-based with nested directories)
  */
-function getThumbnailPath(imagePath) {
-  const ext = path.extname(imagePath).toLowerCase();
-  const thumbExt = ext === '.gif' ? '.webp' : (ext === '.png' ? '.png' : '.jpg');
-  const hash = hashPath(imagePath);
+function getThumbnailPath(mediaPath, mediaType) {
+  const ext = path.extname(mediaPath).toLowerCase();
+  // Videos and GIFs get animated WebP thumbnails
+  const thumbExt = (mediaType === 'video' || ext === '.gif') ? '.webp' : (ext === '.png' ? '.png' : '.jpg');
+  const hash = hashPath(mediaPath);
   // Structure: thumbnails/{hash[0]}/{hash[1]}/{hash}.{ext}
   return path.join(THUMBNAILS_DIR, hash[0], hash[1], hash + thumbExt);
 }
 
 /**
+ * Check if ffmpeg is available on the system
+ */
+function checkFfmpegAvailable() {
+  try {
+    execSync('ffmpeg -version', { stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Get video duration using ffprobe
+ */
+function getVideoDuration(videoPath) {
+  try {
+    const result = execSync(
+      `ffprobe -v error -show_entries format=duration -of csv=p=0 "${videoPath}"`,
+      { encoding: 'utf8', timeout: 10000 }
+    );
+    const duration = parseFloat(result.trim());
+    if (isNaN(duration) || duration <= 0) {
+      return null;
+    }
+    return duration;
+  } catch (err) {
+    return null;
+  }
+}
+
+/**
+ * Generate animated WebP thumbnail from video using ffmpeg
+ * Extracts multiple segments, each with consecutive frames, for smoother animation
+ * Parameters are derived from hash for deterministic variation between videos
+ */
+async function generateVideoThumbnail(videoPath, outputPath) {
+  const duration = getVideoDuration(videoPath);
+  if (!duration) {
+    throw new Error('Could not determine video duration');
+  }
+
+  // Use hash to deterministically vary parameters per video (avoids synchronized cuts)
+  const hash = hashPath(videoPath);
+  const baseSegmentCount = parseInt(hash.slice(0, 2), 16) % 4 + 7;     // 7-10 segments
+  const framesPerSegment = parseInt(hash.slice(2, 4), 16) % 11 + 10;   // 10-20 frames per segment
+
+  // Calculate segment timestamps distributed across video (skip first/last 5% to avoid black frames)
+  const startOffset = duration * 0.05;
+  const endOffset = duration * 0.95;
+  const usableDuration = endOffset - startOffset;
+  const segmentCount = Math.min(baseSegmentCount, Math.max(1, Math.floor(duration))); // At least 1s apart
+  const interval = usableDuration / Math.max(1, segmentCount - 1);
+
+  const segmentTimestamps = [];
+  for (let i = 0; i < segmentCount; i++) {
+    segmentTimestamps.push(startOffset + (i * interval));
+  }
+
+  // Use temp directory for intermediate frames
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'video-thumb-'));
+
+  try {
+    let frameIndex = 0;
+
+    // Extract consecutive frames from each segment
+    for (let seg = 0; seg < segmentTimestamps.length; seg++) {
+      const timestamp = segmentTimestamps[seg];
+
+      // Extract multiple consecutive frames starting at this timestamp
+      for (let f = 0; f < framesPerSegment; f++) {
+        const frameTime = timestamp + (f / 30); // Assume ~30fps source, extract frames ~1/30s apart
+        const framePath = path.join(tempDir, `frame_${frameIndex.toString().padStart(3, '0')}.png`);
+
+        execSync(
+          `ffmpeg -y -ss ${frameTime} -i "${videoPath}" -vframes 1 ` +
+          `-vf "scale=${THUMBNAIL_SIZE}:${THUMBNAIL_SIZE}:force_original_aspect_ratio=increase,crop=${THUMBNAIL_SIZE}:${THUMBNAIL_SIZE}" ` +
+          `"${framePath}"`,
+          { stdio: 'pipe', timeout: 30000 }
+        );
+        frameIndex++;
+      }
+    }
+
+    // Combine all frames into animated WebP
+    execSync(
+      `ffmpeg -y -framerate ${VIDEO_THUMBNAIL_FPS} -i "${tempDir}/frame_%03d.png" ` +
+      `-vf "scale=${THUMBNAIL_SIZE}:${THUMBNAIL_SIZE}" -loop 0 -quality 75 "${outputPath}"`,
+      { stdio: 'pipe', timeout: 60000 }
+    );
+  } finally {
+    // Cleanup temp directory
+    try {
+      const frames = fs.readdirSync(tempDir);
+      for (const frame of frames) {
+        fs.unlinkSync(path.join(tempDir, frame));
+      }
+      fs.rmdirSync(tempDir);
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
+}
+
+/**
  * Generate the images-data.js file
  */
-function generateDataFile(images) {
-  // No thumb field - gallery calculates thumbnail paths from image path hash
+function generateDataFile(media) {
+  const imageCount = media.filter(m => m.type === 'image').length;
+  const videoCount = media.filter(m => m.type === 'video').length;
+
   const content = `// Auto-generated by generate-gallery.js
-// Total images: ${images.length}
+// Total media: ${media.length} (${imageCount} images, ${videoCount} videos)
 // Generated: ${new Date().toISOString()}
 
-const IMAGES = ${JSON.stringify(images, null, 2)};
+const IMAGES = ${JSON.stringify(media, null, 2)};
 
 const IMAGES_PER_PAGE = ${IMAGES_PER_PAGE};
 `;
 
   fs.writeFileSync(path.join(ROOT_DIR, OUTPUT_DATA_FILE), content);
-  console.log(`Generated ${OUTPUT_DATA_FILE} with ${images.length} images`);
+  console.log(`Generated ${OUTPUT_DATA_FILE} with ${imageCount} images and ${videoCount} videos`);
 }
 
 /**
@@ -272,6 +386,23 @@ function generateHtmlFile() {
       font-size: 0.75rem;
     }
 
+    .thumbnail .play-indicator {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 3rem;
+      color: rgba(255, 255, 255, 0.85);
+      text-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+      pointer-events: none;
+      transition: transform 0.2s, color 0.2s;
+    }
+
+    .thumbnail:hover .play-indicator {
+      transform: translate(-50%, -50%) scale(1.1);
+      color: #e94560;
+    }
+
     /* Lightbox */
     .lightbox {
       display: none;
@@ -303,6 +434,12 @@ function generateHtmlFile() {
       max-width: 95vw;
       max-height: 85vh;
       object-fit: contain;
+    }
+
+    .lightbox-content video {
+      max-width: 95vw;
+      max-height: 85vh;
+      outline: none;
     }
 
     .lightbox-info {
@@ -438,6 +575,9 @@ function generateHtmlFile() {
     <div class="lightbox-content">
       <div class="loading-spinner" id="lightbox-spinner"></div>
       <img id="lightbox-img" src="" alt="">
+      <video id="lightbox-video" controls style="display: none;">
+        Your browser does not support the video tag.
+      </video>
       <div class="lightbox-info">
         <div class="path" id="lightbox-path"></div>
         <div class="position" id="lightbox-position"></div>
@@ -477,11 +617,12 @@ function generateHtmlFile() {
              (h2 >>> 0).toString(16).padStart(8, '0');
     }
 
-    // Get thumbnail path for an image (hash-based)
-    function getThumbnailPath(imagePath) {
-      const ext = imagePath.slice(imagePath.lastIndexOf('.')).toLowerCase();
-      const thumbExt = ext === '.gif' ? '.webp' : (ext === '.png' ? '.png' : '.jpg');
-      const hash = hashPath(imagePath);
+    // Get thumbnail path for a media file (hash-based)
+    function getThumbnailPath(mediaPath, mediaType) {
+      const ext = mediaPath.slice(mediaPath.lastIndexOf('.')).toLowerCase();
+      // Videos and GIFs get animated WebP thumbnails
+      const thumbExt = (mediaType === 'video' || ext === '.gif') ? '.webp' : (ext === '.png' ? '.png' : '.jpg');
+      const hash = hashPath(mediaPath);
       return 'thumbnails/' + hash[0] + '/' + hash[1] + '/' + hash + thumbExt;
     }
 
@@ -490,38 +631,46 @@ function generateHtmlFile() {
       const gallery = document.getElementById('gallery');
       const start = currentPage * IMAGES_PER_PAGE;
       const end = Math.min(start + IMAGES_PER_PAGE, IMAGES.length);
-      const pageImages = IMAGES.slice(start, end);
+      const pageMedia = IMAGES.slice(start, end);
 
       if (IMAGES.length === 0) {
-        gallery.innerHTML = '<div class="no-images"><h2>No images found</h2><p>Run generate-gallery.js in a folder containing images.</p></div>';
+        gallery.innerHTML = '<div class="no-images"><h2>No media found</h2><p>Run generate-gallery.js in a folder containing images or videos.</p></div>';
         return;
       }
 
-      gallery.innerHTML = pageImages.map((img, i) => {
+      gallery.innerHTML = pageMedia.map((media, i) => {
         const globalIndex = start + i;
-        const thumbPath = getThumbnailPath(img.path);
+        const thumbPath = getThumbnailPath(media.path, media.type);
+        const isVideo = media.type === 'video';
         // Try thumbnail first, fall back to original on error
         return \`
           <div class="thumbnail" onclick="openLightbox(\${globalIndex})">
             <div class="loading-spinner"></div>
             <img
               src="\${encodeURI(thumbPath)}"
-              data-original="\${encodeURI(img.path)}"
-              alt="\${img.path}"
+              data-original="\${encodeURI(media.path)}"
+              data-type="\${media.type}"
+              alt="\${media.path}"
               class="loading"
               loading="lazy"
               onload="this.classList.remove('loading'); this.previousElementSibling.style.display='none';"
-              onerror="if(this.src !== this.dataset.original) { this.src = this.dataset.original; } else { this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>❌</text></svg>'; this.previousElementSibling.style.display='none'; }"
+              onerror="if(this.dataset.type !== 'video' && this.src !== this.dataset.original) { this.src = this.dataset.original; } else { this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>❌</text></svg>'; this.classList.remove('loading'); this.previousElementSibling.style.display='none'; }"
             >
+            \${isVideo ? '<div class="play-indicator">&#9658;</div>' : ''}
             <span class="index-badge">#\${globalIndex + 1}</span>
-            <span class="size-badge">\${formatBytes(img.size)}</span>
+            <span class="size-badge">\${formatBytes(media.size)}</span>
           </div>
         \`;
       }).join('');
 
       // Update page info
       document.getElementById('page-info').textContent = \`Page \${currentPage + 1} of \${totalPages}\`;
-      document.getElementById('total-info').textContent = \`\${IMAGES.length} images\`;
+
+      // Show image/video counts
+      const imageCount = IMAGES.filter(m => m.type === 'image').length;
+      const videoCount = IMAGES.filter(m => m.type === 'video').length;
+      const totalText = videoCount > 0 ? \`\${imageCount} images, \${videoCount} videos\` : \`\${IMAGES.length} images\`;
+      document.getElementById('total-info').textContent = totalText;
 
       // Update button states
       document.getElementById('prev-btn').disabled = currentPage === 0;
@@ -558,26 +707,52 @@ function generateHtmlFile() {
       lightboxActive = false;
       document.getElementById('lightbox').classList.remove('active');
       document.body.style.overflow = '';
+
+      // Stop video playback when closing
+      const video = document.getElementById('lightbox-video');
+      video.pause();
+      video.src = '';
     }
 
     function updateLightbox() {
-      const img = IMAGES[currentLightboxIndex];
+      const media = IMAGES[currentLightboxIndex];
       const lightboxImg = document.getElementById('lightbox-img');
+      const lightboxVideo = document.getElementById('lightbox-video');
       const spinner = document.getElementById('lightbox-spinner');
+      const isVideo = media.type === 'video';
 
       spinner.style.display = 'block';
+
+      // Hide both initially
+      lightboxImg.style.display = 'none';
       lightboxImg.style.opacity = '0';
+      lightboxVideo.style.display = 'none';
+      lightboxVideo.pause();
 
-      lightboxImg.onload = function() {
-        spinner.style.display = 'none';
-        lightboxImg.style.opacity = '1';
-      };
+      if (isVideo) {
+        // Show video player
+        lightboxVideo.src = encodeURI(media.path);
+        lightboxVideo.style.display = 'block';
+        lightboxVideo.play();
+        lightboxVideo.onloadeddata = function() {
+          spinner.style.display = 'none';
+        };
+        lightboxVideo.onerror = function() {
+          spinner.style.display = 'none';
+        };
+      } else {
+        // Show image
+        lightboxImg.style.display = 'block';
+        lightboxImg.onload = function() {
+          spinner.style.display = 'none';
+          lightboxImg.style.opacity = '1';
+        };
+        lightboxImg.src = encodeURI(media.path);
+      }
 
-      // Always load original for lightbox
-      lightboxImg.src = encodeURI(img.path);
-      document.getElementById('lightbox-path').textContent = img.path;
-      document.getElementById('lightbox-position').textContent = \`Image \${currentLightboxIndex + 1} of \${IMAGES.length}\`;
-      document.getElementById('lightbox-size').textContent = formatBytes(img.size);
+      document.getElementById('lightbox-path').textContent = media.path;
+      document.getElementById('lightbox-position').textContent = \`\${isVideo ? 'Video' : 'Image'} \${currentLightboxIndex + 1} of \${IMAGES.length}\`;
+      document.getElementById('lightbox-size').textContent = formatBytes(media.size);
     }
 
     function lightboxNext() {
@@ -634,15 +809,23 @@ function generateHtmlFile() {
 /**
  * Generate thumbnails progressively
  */
-async function generateThumbnails(images) {
+async function generateThumbnails(media) {
   let sharp;
   try {
     sharp = require('sharp');
   } catch (err) {
-    console.log('\n⚠️  sharp module not found. Install it for thumbnail generation:');
+    console.log('\n  sharp module not found. Install it for thumbnail generation:');
     console.log('   npm install sharp');
-    console.log('\nGallery will work without thumbnails (using original images).\n');
+    console.log('\nGallery will work without thumbnails (using original files).\n');
     return;
+  }
+
+  // Check for videos and ffmpeg availability
+  const hasVideos = media.some(m => m.type === 'video');
+  const hasFfmpeg = checkFfmpegAvailable();
+  if (hasVideos && !hasFfmpeg) {
+    console.log('\n  ffmpeg not found. Video thumbnails will be skipped.');
+    console.log('Install ffmpeg to enable video thumbnail generation.\n');
   }
 
   console.log(`\nGenerating thumbnails (${THUMBNAIL_SIZE}px, ${CONCURRENT_THUMBNAILS} concurrent)...`);
@@ -653,17 +836,24 @@ async function generateThumbnails(images) {
   let skipped = 0;
   let failed = 0;
 
-  // Process images in batches
-  const queue = [...images];
+  // Process media in batches
+  const queue = [...media];
 
   async function processOne() {
     while (queue.length > 0) {
-      const img = queue.shift();
-      const thumbPath = path.join(ROOT_DIR, getThumbnailPath(img.path));
+      const item = queue.shift();
+      const thumbPath = path.join(ROOT_DIR, getThumbnailPath(item.path, item.type));
       const thumbDir = path.dirname(thumbPath);
 
       // Skip if thumbnail already exists
       if (fs.existsSync(thumbPath)) {
+        skipped++;
+        completed++;
+        continue;
+      }
+
+      // Skip video thumbnails if ffmpeg not available
+      if (item.type === 'video' && !hasFfmpeg) {
         skipped++;
         completed++;
         continue;
@@ -675,11 +865,14 @@ async function generateThumbnails(images) {
       }
 
       try {
-        const inputPath = path.join(ROOT_DIR, img.path);
-        const ext = path.extname(img.path).toLowerCase();
+        const inputPath = path.join(ROOT_DIR, item.path);
+        const ext = path.extname(item.path).toLowerCase();
 
-        // For animated GIFs, preserve animation using WebP (better compression)
-        if (ext === '.gif') {
+        if (item.type === 'video') {
+          // Use ffmpeg for video thumbnails
+          await generateVideoThumbnail(inputPath, thumbPath);
+        } else if (ext === '.gif') {
+          // For animated GIFs, preserve animation using WebP (better compression)
           await sharp(inputPath, { animated: true })
             .resize(THUMBNAIL_SIZE, THUMBNAIL_SIZE, { fit: 'cover' })
             .webp({ quality: 75 })
@@ -703,13 +896,13 @@ async function generateThumbnails(images) {
         // Don't spam errors, just count them
       }
 
-      // Progress update every 10 images or at the end
-      if (completed % 10 === 0 || completed === images.length) {
-        const percent = ((completed / images.length) * 100).toFixed(1);
+      // Progress update every 10 items or at the end
+      if (completed % 10 === 0 || completed === media.length) {
+        const percent = ((completed / media.length) * 100).toFixed(1);
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
         const rate = (completed / (Date.now() - startTime) * 1000).toFixed(1);
-        const eta = completed > 0 ? (((images.length - completed) / rate)).toFixed(0) : '?';
-        process.stdout.write(`\rProgress: ${completed}/${images.length} (${percent}%) | ${rate}/s | ETA: ${eta}s | Skipped: ${skipped} | Failed: ${failed}   `);
+        const eta = completed > 0 ? (((media.length - completed) / rate)).toFixed(0) : '?';
+        process.stdout.write(`\rProgress: ${completed}/${media.length} (${percent}%) | ${rate}/s | ETA: ${eta}s | Skipped: ${skipped} | Failed: ${failed}   `);
       }
     }
   }
@@ -730,32 +923,34 @@ async function generateThumbnails(images) {
 // Main execution
 async function main() {
   console.log('');
-  console.log('Searching for images...');
-  const images = findImages(ROOT_DIR);
+  console.log('Searching for media files...');
+  const media = findMedia(ROOT_DIR);
 
-  console.log(`Found ${images.length} images`);
+  const imageCount = media.filter(m => m.type === 'image').length;
+  const videoCount = media.filter(m => m.type === 'video').length;
+  console.log(`Found ${media.length} files (${imageCount} images, ${videoCount} videos)`);
   if (duplicatesSkipped > 0) {
     console.log(`Skipped ${duplicatesSkipped} duplicates (same file size)`);
   }
 
   // Sort by size (descending) - largest first for thumbnail generation priority
-  images.sort((a, b) => b.size - a.size);
+  media.sort((a, b) => b.size - a.size);
 
-  if (images.length > 0) {
-    console.log(`Largest: ${images[0].path} (${formatBytes(images[0].size)})`);
-    console.log(`Smallest: ${images[images.length - 1].path} (${formatBytes(images[images.length - 1].size)})`);
+  if (media.length > 0) {
+    console.log(`Largest: ${media[0].path} (${formatBytes(media[0].size)})`);
+    console.log(`Smallest: ${media[media.length - 1].path} (${formatBytes(media[media.length - 1].size)})`);
   }
 
   console.log('');
-  generateDataFile(images);
+  generateDataFile(media);
   generateHtmlFile();
 
   console.log('');
   console.log('Gallery ready! Open gallery.html in your browser.');
-  console.log(`Total pages: ${Math.ceil(images.length / IMAGES_PER_PAGE)}`);
+  console.log(`Total pages: ${Math.ceil(media.length / IMAGES_PER_PAGE)}`);
 
   // Start thumbnail generation (progressive - user can browse immediately)
-  await generateThumbnails(images);
+  await generateThumbnails(media);
 }
 
 main().catch(err => {
