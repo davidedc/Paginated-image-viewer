@@ -137,3 +137,10 @@ dist
 .DS_Store
 gallery.html
 images-data.js
+
+# Media directories (test content)
+1/
+2/
+and another/
+another dir/
+thumbnails/
