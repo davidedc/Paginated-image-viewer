@@ -8,7 +8,7 @@ A static gallery generator that creates a standalone, paginated HTML viewer for 
 
 ## Features
 
-- **Multi-format support**: Images (JPG, PNG, GIF, WebP, BMP) and videos (MP4)
+- **Multi-format support**: Images (JPG, PNG, GIF, WebP, BMP) and videos (MP4, WebM)
 - **Animated thumbnails**: Videos and GIFs get animated WebP previews
 - **Paginated grid**: 15 items per page with keyboard navigation
 - **Lightbox viewer**: Full-size viewing with native video controls

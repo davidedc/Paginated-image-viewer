@@ -4,7 +4,7 @@
 
 ### 1.1 Supported Formats
 - **Images**: JPG, JPEG, PNG, GIF, WebP, BMP
-- **Videos**: MP4
+- **Videos**: MP4, WebM
 
 ### 1.2 File Discovery
 - Recursively scan all subdirectories for media files

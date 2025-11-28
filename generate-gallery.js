@@ -24,7 +24,7 @@ const OUTPUT_DIR = path.resolve(options.output || options.input);
 // Configuration
 const IMAGES_PER_PAGE = 15;
 const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'];
-const VIDEO_EXTENSIONS = ['.mp4'];
+const VIDEO_EXTENSIONS = ['.mp4', '.webm'];
 const MEDIA_EXTENSIONS = [...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS];
 const GALLERY_DATA_DIR = path.join(OUTPUT_DIR, '.gallery-data');
 const OUTPUT_DATA_FILE = path.join(GALLERY_DATA_DIR, 'images-data.js');
