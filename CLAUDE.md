@@ -27,17 +27,18 @@ node delete-video-thumbnails.js
 
 - `generate-gallery.js` - Main script that:
   - Recursively finds images (.jpg, .jpeg, .png, .gif, .webp, .bmp) and videos (.mp4)
-  - Generates `images-data.js` with media metadata (path, size, type)
+  - Generates `.gallery-data/images-data.js` with media metadata (path, size, type)
   - Generates `gallery.html` with embedded CSS/JS (standalone, no external deps)
-  - Creates thumbnails in `thumbnails/{hash[0]}/{hash[1]}/{hash}.{ext}`
+  - Creates thumbnails in `.gallery-data/thumbnails/{hash[0]}/{hash[1]}/{hash}.{ext}`
 
 - `delete-video-thumbnails.js` - Utility to delete video thumbnails for regeneration
 
 ### Generated Files
 
 - `gallery.html` - Standalone viewer (open in browser)
-- `images-data.js` - Media metadata array
-- `thumbnails/` - Hash-based directory structure for cached thumbnails
+- `.gallery-data/` - Hidden folder containing:
+  - `images-data.js` - Media metadata array
+  - `thumbnails/` - Hash-based directory structure for cached thumbnails
 
 ### Key Implementation Details
 
