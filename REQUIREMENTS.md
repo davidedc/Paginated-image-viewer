@@ -259,3 +259,44 @@
 - Centered content
 - Close button (×) top-right
 - Navigation arrows left/right
+
+---
+
+## 13. Command Line Interface
+
+### 13.1 Usage
+```
+node generate-gallery.js [options]
+```
+
+### 13.2 Options
+
+| Option | Short | Description | Default |
+|--------|-------|-------------|---------|
+| `--help` | `-h` | Display help message | — |
+| `--input <dir>` | `-i` | Source directory to scan for media | Current working directory |
+| `--output <dir>` | `-o` | Output directory for gallery files | Same as input directory |
+| `--title <text>` | `-t` | Gallery title (browser tab and header) | "Image Gallery" |
+
+### 13.3 Examples
+```bash
+# Default: scan current directory, output to current directory
+node generate-gallery.js
+
+# Specify input directory
+node generate-gallery.js -i /path/to/photos
+
+# Specify both input and output directories
+node generate-gallery.js -i ./photos -o ./public
+
+# Custom title
+node generate-gallery.js -t "Vacation 2024"
+
+# Full example with all options
+node generate-gallery.js -i ./vacation -o ./website -t "Summer Trip 2024"
+```
+
+### 13.4 Output Directory Behavior
+- When `--output` differs from `--input`, media paths in the gallery are calculated relative to `gallery.html`
+- Thumbnails (`.gallery-data/`) are always placed in the output directory
+- The gallery can reference media files in a different directory via relative paths
